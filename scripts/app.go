@@ -21,46 +21,61 @@ import (
 )
 
 const (
-	defaultMatrixHost               = "192.168.178.10"
-	defaultMatrixPort               = 23
-	defaultMatrixTimeout            = 2 * time.Second
-	defaultMatrixCommandDelay       = 1 * time.Second
-	defaultMatrixStatusPollInterval = 60 * time.Second
-	defaultMatrixInputs             = 4
-	defaultMatrixOutputs            = 4
-	defaultHTTPHost                 = "0.0.0.0"
-	defaultHTTPPort                 = 62225
-	matrixManufacturer              = "AV Access"
+	defaultMatrixHost             = "192.168.178.10"
+	defaultMatrixPort             = 23
+	defaultMatrixTimeout          = 2 * time.Second
+	defaultMatrixCommandDelay     = 1 * time.Second
+	defaultStatusPollInterval     = 3 * time.Second
+	defaultFullSyncInterval       = 60 * time.Second
+	defaultSSEKeepaliveInterval   = 30 * time.Second
+	defaultMatrixInputs           = 4
+	defaultMatrixOutputs          = 4
+	defaultHTTPHost               = "0.0.0.0"
+	defaultHTTPPort               = 62225
+	matrixManufacturer            = "AV Access"
+	legacyStatusPollIntervalEnvar = "HDMI_MATRIX_STATUS_POLL_INTERVAL"
 )
 
 type config struct {
-	matrixHost               string
-	matrixPort               int
-	matrixTimeout            time.Duration
-	matrixCommandDelay       time.Duration
-	matrixStatusPollInterval time.Duration
-	matrixInputs             int
-	matrixOutputs            int
-	matrixConfigurationURL   string
-	httpHost                 string
-	httpPort                 int
-	logLevel                 string
+	matrixHost             string
+	matrixPort             int
+	matrixTimeout          time.Duration
+	matrixCommandDelay     time.Duration
+	statusPollInterval     time.Duration
+	fullSyncInterval       time.Duration
+	sseKeepaliveInterval   time.Duration
+	matrixInputs           int
+	matrixOutputs          int
+	matrixConfigurationURL string
+	httpHost               string
+	httpPort               int
+	logLevel               string
 }
 
 func loadConfig() config {
 	return config{
-		matrixHost:               envString("HDMI_MATRIX_IP", defaultMatrixHost),
-		matrixPort:               envInt("HDMI_MATRIX_PORT", defaultMatrixPort),
-		matrixTimeout:            envDurationSeconds("HDMI_MATRIX_TIMEOUT", defaultMatrixTimeout),
-		matrixCommandDelay:       envDurationSeconds("HDMI_MATRIX_COMMAND_DELAY", defaultMatrixCommandDelay),
-		matrixStatusPollInterval: envDurationSeconds("HDMI_MATRIX_STATUS_POLL_INTERVAL", defaultMatrixStatusPollInterval),
-		matrixInputs:             envInt("HDMI_MATRIX_INPUTS", 0),
-		matrixOutputs:            envInt("HDMI_MATRIX_OUTPUTS", 0),
-		matrixConfigurationURL:   envString("HDMI_MATRIX_CONFIGURATION_URL", ""),
-		httpHost:                 envString("HTTP_HOST", defaultHTTPHost),
-		httpPort:                 envInt("HTTP_PORT", defaultHTTPPort),
-		logLevel:                 strings.ToUpper(envString("LOG_LEVEL", "INFO")),
+		matrixHost:             envString("HDMI_MATRIX_IP", defaultMatrixHost),
+		matrixPort:             envInt("HDMI_MATRIX_PORT", defaultMatrixPort),
+		matrixTimeout:          envDurationSeconds("HDMI_MATRIX_TIMEOUT", defaultMatrixTimeout),
+		matrixCommandDelay:     envDurationSeconds("HDMI_MATRIX_COMMAND_DELAY", defaultMatrixCommandDelay),
+		statusPollInterval:     envDurationSeconds("STATUS_POLL_INTERVAL", defaultStatusPollInterval),
+		fullSyncInterval:       fullSyncInterval(),
+		sseKeepaliveInterval:   envDurationSeconds("SSE_KEEPALIVE_INTERVAL", defaultSSEKeepaliveInterval),
+		matrixInputs:           envInt("HDMI_MATRIX_INPUTS", 0),
+		matrixOutputs:          envInt("HDMI_MATRIX_OUTPUTS", 0),
+		matrixConfigurationURL: envString("HDMI_MATRIX_CONFIGURATION_URL", ""),
+		httpHost:               envString("HTTP_HOST", defaultHTTPHost),
+		httpPort:               envInt("HTTP_PORT", defaultHTTPPort),
+		logLevel:               strings.ToUpper(envString("LOG_LEVEL", "INFO")),
 	}
+}
+
+// fullSyncInterval liest das Intervall des vollständigen Matrix-Syncs. Der
+// frühere Name HDMI_MATRIX_STATUS_POLL_INTERVAL bleibt als Alias gültig, damit
+// bestehende Deployments unverändert weiterlaufen.
+func fullSyncInterval() time.Duration {
+	fallback := envDurationSeconds(legacyStatusPollIntervalEnvar, defaultFullSyncInterval)
+	return envDurationSeconds("FULL_SYNC_INTERVAL", fallback)
 }
 
 func envString(name, fallback string) string {
@@ -83,18 +98,24 @@ func envInt(name string, fallback int) int {
 	return number
 }
 
+// envDurationSeconds akzeptiert reine Sekundenwerte ("60", "0.5") und
+// Go-Dauerangaben ("3s", "1m30s").
 func envDurationSeconds(name string, fallback time.Duration) time.Duration {
 	value := os.Getenv(name)
 	if value == "" {
 		return fallback
 	}
 
-	seconds, err := strconv.ParseFloat(value, 64)
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
+		return time.Duration(seconds * float64(time.Second))
+	}
+
+	duration, err := time.ParseDuration(value)
 	if err != nil {
 		log.Fatalf("Invalid %s=%q: %v", name, value, err)
 	}
 
-	return time.Duration(seconds * float64(time.Second))
+	return duration
 }
 
 var debugEnabled bool
@@ -114,6 +135,22 @@ type matrixStatusCache struct {
 	hdcpUnsupported bool
 	initialized     bool
 	updatedAt       time.Time
+
+	// bulkMappingUnsupported merkt sich, dass die Matrix "GET MP all" nicht
+	// beherrscht, damit der schnelle Poll nicht bei jedem Durchlauf erneut
+	// in ein Lese-Timeout läuft.
+	bulkMappingUnsupported bool
+	bulkMappingTimeouts    int
+
+	// revision zählt ausschließlich echte Änderungen am veröffentlichten
+	// State. Damit erkennen SSE-Publisher, ob ein Poll etwas Neues geliefert
+	// hat, ohne den State selbst vergleichen zu müssen.
+	revision uint64
+}
+
+// markChangedLocked meldet eine tatsächliche Änderung des Caches.
+func (c *matrixStatusCache) markChangedLocked() {
+	c.revision++
 }
 
 // resize passt die Cache-Größe an die tatsächliche Portanzahl der Matrix an.
@@ -131,6 +168,27 @@ func (c *matrixStatusCache) resize(inputs, outputs int) {
 	c.hdcp = make([]bool, inputs+1)
 	c.initialized = false
 	c.hdcpInitialized = false
+	c.markChangedLocked()
+}
+
+// snapshotLocked baut den vollständigen Controller-State. /status und der
+// SSE-Stream nutzen dieselbe Funktion und damit dasselbe Statusmodell.
+func (c *matrixStatusCache) snapshotLocked() map[string]any {
+	result := make(map[string]any, len(c.outputs)+2*len(c.edids))
+
+	for output := 1; output < len(c.outputs); output++ {
+		result[fmt.Sprintf("out%d_in", output)] = c.outputs[output]
+	}
+	for input := 1; input < len(c.edids); input++ {
+		result[fmt.Sprintf("edid_in%d", input)] = c.edids[input]
+	}
+	if c.hdcpInitialized {
+		for input := 1; input < len(c.hdcp); input++ {
+			result[fmt.Sprintf("hdcp_in%d", input)] = c.hdcp[input]
+		}
+	}
+
+	return result
 }
 
 // deviceIdentity sammelt alles, was die Matrix über sich selbst meldet.
@@ -690,8 +748,14 @@ func (m *matrixConnection) storeOutput(outputNumber, input int) {
 		return
 	}
 
-	m.cache.outputs[outputNumber] = input
 	m.cache.updatedAt = time.Now()
+
+	if m.cache.outputs[outputNumber] == input {
+		return
+	}
+
+	m.cache.outputs[outputNumber] = input
+	m.cache.markChangedLocked()
 }
 
 func (m *matrixConnection) storeEDID(inputNumber, edid int) {
@@ -702,8 +766,14 @@ func (m *matrixConnection) storeEDID(inputNumber, edid int) {
 		return
 	}
 
-	m.cache.edids[inputNumber] = edid
 	m.cache.updatedAt = time.Now()
+
+	if m.cache.edids[inputNumber] == edid {
+		return
+	}
+
+	m.cache.edids[inputNumber] = edid
+	m.cache.markChangedLocked()
 }
 
 func (m *matrixConnection) storeHDCP(inputNumber int, enabled bool) {
@@ -714,9 +784,15 @@ func (m *matrixConnection) storeHDCP(inputNumber int, enabled bool) {
 		return
 	}
 
-	m.cache.hdcp[inputNumber] = enabled
-	m.cache.hdcpUnsupported = false
 	m.cache.updatedAt = time.Now()
+	m.cache.hdcpUnsupported = false
+
+	if m.cache.hdcp[inputNumber] == enabled {
+		return
+	}
+
+	m.cache.hdcp[inputNumber] = enabled
+	m.cache.markChangedLocked()
 }
 
 func (m *matrixConnection) markHDCPUnsupported() {
@@ -724,7 +800,14 @@ func (m *matrixConnection) markHDCPUnsupported() {
 	defer m.cache.mu.Unlock()
 
 	m.cache.hdcpUnsupported = true
+
+	if !m.cache.hdcpInitialized {
+		return
+	}
+
+	// Die hdcp_inX-Felder verschwinden damit aus dem State.
 	m.cache.hdcpInitialized = false
+	m.cache.markChangedLocked()
 }
 
 // HDCPSupported meldet false, sobald die Matrix ein HDCP-Kommando mit ihrer
@@ -783,21 +866,31 @@ func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 	}
 }
 
-// parseOutputResponse zerlegt die Antwort auf GET MP. Die Matrix meldet je nach
+// parseMappingLine zerlegt eine einzelne MP-Zeile. Die Matrix meldet je nach
 // Firmware "MP hdmiin2 hdmiout1" oder "MP in2 hdmiout1".
-func (m *matrixConnection) parseOutputResponse(response string, outputNumber int) (int, bool) {
-	match := mappingRe.FindStringSubmatch(strings.TrimSpace(response))
+func parseMappingLine(line string, inputs, outputs int) (int, int, bool) {
+	match := mappingRe.FindStringSubmatch(strings.TrimSpace(line))
 	if match == nil {
-		return 0, false
+		return 0, 0, false
 	}
 
 	input, err := strconv.Atoi(match[1])
-	if err != nil || input < 1 || input > m.InputCount() {
-		return 0, false
+	if err != nil || input < 1 || input > inputs {
+		return 0, 0, false
 	}
 
 	output, err := strconv.Atoi(match[2])
-	if err != nil || output != outputNumber {
+	if err != nil || output < 1 || output > outputs {
+		return 0, 0, false
+	}
+
+	return input, output, true
+}
+
+// parseOutputResponse zerlegt die Antwort auf GET MP für einen Ausgang.
+func (m *matrixConnection) parseOutputResponse(response string, outputNumber int) (int, bool) {
+	input, output, ok := parseMappingLine(response, m.InputCount(), m.OutputCount())
+	if !ok || output != outputNumber {
 		return 0, false
 	}
 
@@ -1082,12 +1175,187 @@ func (m *matrixConnection) RefreshStatus() error {
 	}
 
 	m.cache.mu.Lock()
-	m.cache.initialized = true
-	if hdcpInitialized {
+	if !m.cache.initialized {
+		m.cache.initialized = true
+		m.cache.markChangedLocked()
+	}
+	if hdcpInitialized && !m.cache.hdcpInitialized {
 		m.cache.hdcpInitialized = true
+		m.cache.markChangedLocked()
 	}
 	m.cache.updatedAt = time.Now()
 	m.cache.mu.Unlock()
+
+	return nil
+}
+
+// bulkMappingCommand fragt das Routing aller Ausgänge mit einem einzigen
+// Telnet-Kommando ab.
+const bulkMappingCommand = "GET MP all"
+
+// bulkMappingTimeoutLimit legt fest, nach wie vielen Timeouts in Folge das
+// Sammelkommando als nicht unterstützt gilt. Ein einzelnes Timeout ist meist
+// nur ein Transportproblem und darf den schnellen Poll nicht dauerhaft
+// verschlechtern.
+const bulkMappingTimeoutLimit = 3
+
+// errBulkMappingTimeout meldet, dass die Matrix das Sammelkommando nicht
+// rechtzeitig vollständig beantwortet hat.
+var errBulkMappingTimeout = errors.New("matrix did not answer the bulk mapping command in time")
+
+func (m *matrixConnection) bulkMappingSupported() bool {
+	m.cache.mu.RLock()
+	defer m.cache.mu.RUnlock()
+
+	return !m.cache.bulkMappingUnsupported
+}
+
+func (m *matrixConnection) markBulkMappingUnsupported() {
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+
+	m.cache.bulkMappingUnsupported = true
+}
+
+func (m *matrixConnection) noteBulkMappingSuccess() {
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+
+	m.cache.bulkMappingTimeouts = 0
+}
+
+// noteBulkMappingTimeout zählt Timeouts in Folge und meldet, ob das
+// Sammelkommando deswegen ab jetzt übersprungen wird.
+func (m *matrixConnection) noteBulkMappingTimeout() bool {
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+
+	m.cache.bulkMappingTimeouts++
+	if m.cache.bulkMappingTimeouts < bulkMappingTimeoutLimit {
+		return false
+	}
+
+	m.cache.bulkMappingUnsupported = true
+	return true
+}
+
+// RefreshRouting aktualisiert nur das Input/Output-Routing. Das ist der Wert,
+// der sich bei physischen Umschaltungen am Frontpanel ändert, deshalb genügt
+// dem schnellen Poll dieses eine Kommando.
+func (m *matrixConnection) RefreshRouting() error {
+	if m.bulkMappingSupported() {
+		err := m.refreshRoutingBulk()
+
+		switch {
+		case err == nil:
+			m.noteBulkMappingSuccess()
+			return nil
+		case errors.Is(err, errCommandUnsupported):
+			// Die Matrix hat mit ihrer Welcome-Zeile geantwortet und kennt
+			// das Kommando damit sicher nicht.
+			log.Printf(
+				"INFO Matrix does not support %q; falling back to per-output routing polls",
+				bulkMappingCommand,
+			)
+			m.markBulkMappingUnsupported()
+		case errors.Is(err, errBulkMappingTimeout):
+			if m.noteBulkMappingTimeout() {
+				log.Printf(
+					"WARNING Matrix did not answer %q %d times in a row; falling back to per-output routing polls",
+					bulkMappingCommand,
+					bulkMappingTimeoutLimit,
+				)
+			} else {
+				debugf("%s timed out; using per-output routing polls this cycle", bulkMappingCommand)
+			}
+		default:
+			return err
+		}
+	}
+
+	outputs := m.OutputCount()
+	for output := 1; output <= outputs; output++ {
+		if _, err := m.GetOutput(output); err != nil {
+			return fmt.Errorf("refreshing output %d: %w", output, err)
+		}
+	}
+
+	return nil
+}
+
+// refreshRoutingBulk wertet die mehrzeilige Antwort von "GET MP all" aus. Die
+// Matrix trennt diese Zeilen laut Command Set nur mit <CR> und schließt erst
+// die letzte mit <CR><LF> ab, deshalb kann eine gelesene Zeile mehrere
+// Mappings enthalten.
+func (m *matrixConnection) refreshRoutingBulk() error {
+	outputs := m.OutputCount()
+	inputs := m.InputCount()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.ensureConnectedLocked(); err != nil {
+		return err
+	}
+
+	if err := m.writeLineLocked(bulkMappingCommand); err != nil {
+		m.closeLocked()
+		return fmt.Errorf("%s: %w", bulkMappingCommand, err)
+	}
+
+	mapping := make(map[int]int, outputs)
+	maxLines := 2*outputs + 8
+
+	for line := 0; len(mapping) < outputs; line++ {
+		if line >= maxLines {
+			// Die Matrix redet, liefert aber keine vollständige Zuordnung.
+			// Der Lesepuffer ist damit nicht mehr synchron.
+			m.closeLocked()
+			return fmt.Errorf("%s: %w", bulkMappingCommand, errBulkMappingTimeout)
+		}
+
+		response, err := m.readLineLocked()
+		if err != nil {
+			m.closeLocked()
+
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				debugf(
+					"%s returned %d of %d mappings before timing out",
+					bulkMappingCommand,
+					len(mapping),
+					outputs,
+				)
+				return fmt.Errorf("%s: %w", bulkMappingCommand, errBulkMappingTimeout)
+			}
+
+			return fmt.Errorf("%s: %w", bulkMappingCommand, err)
+		}
+
+		if isGreetingLine(response) {
+			m.setModel(parseGreetingModel(response))
+			return fmt.Errorf("%s: %w", bulkMappingCommand, errCommandUnsupported)
+		}
+
+		matched := false
+		for _, part := range strings.Split(response, "\r") {
+			input, output, ok := parseMappingLine(part, inputs, outputs)
+			if !ok {
+				continue
+			}
+
+			mapping[output] = input
+			matched = true
+		}
+
+		if !matched {
+			m.sniffIdentityLine(response)
+			debugf("Ignoring unexpected response: %q", response)
+		}
+	}
+
+	for output, input := range mapping {
+		m.storeOutput(output, input)
+	}
 
 	return nil
 }
@@ -1100,20 +1368,20 @@ func (m *matrixConnection) CachedStatus() (map[string]any, bool) {
 		return nil, false
 	}
 
-	result := make(map[string]any, len(m.cache.outputs)+2*len(m.cache.edids))
-	for output := 1; output < len(m.cache.outputs); output++ {
-		result[fmt.Sprintf("out%d_in", output)] = m.cache.outputs[output]
-	}
-	for input := 1; input < len(m.cache.edids); input++ {
-		result[fmt.Sprintf("edid_in%d", input)] = m.cache.edids[input]
-	}
-	if m.cache.hdcpInitialized {
-		for input := 1; input < len(m.cache.hdcp); input++ {
-			result[fmt.Sprintf("hdcp_in%d", input)] = m.cache.hdcp[input]
-		}
+	return m.cache.snapshotLocked(), true
+}
+
+// CachedState liefert denselben State wie CachedStatus plus die Revision, mit
+// der Publisher erkennen, ob sich seit dem letzten Mal etwas geändert hat.
+func (m *matrixConnection) CachedState() (map[string]any, uint64, bool) {
+	m.cache.mu.RLock()
+	defer m.cache.mu.RUnlock()
+
+	if !m.cache.initialized {
+		return nil, 0, false
 	}
 
-	return result, true
+	return m.cache.snapshotLocked(), m.cache.revision, true
 }
 
 func (m *matrixConnection) CachedHDCPStatus() (map[string]bool, bool) {
@@ -1239,7 +1507,39 @@ func (m *matrixConnection) DeviceInfo() (deviceInfoResponse, bool) {
 }
 
 type apiServer struct {
-	matrix *matrixConnection
+	matrix            *matrixConnection
+	events            *stateNotifier
+	keepaliveInterval time.Duration
+}
+
+func newAPIServer(
+	matrix *matrixConnection,
+	events *stateNotifier,
+	keepaliveInterval time.Duration,
+) *apiServer {
+	if keepaliveInterval <= 0 {
+		keepaliveInterval = defaultSSEKeepaliveInterval
+	}
+
+	return &apiServer{
+		matrix:            matrix,
+		events:            events,
+		keepaliveInterval: keepaliveInterval,
+	}
+}
+
+func newRouter(api *apiServer) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", api.healthHandler)
+	mux.HandleFunc("/device-info", api.deviceInfoHandler)
+	mux.HandleFunc("/status", api.statusHandler)
+	mux.HandleFunc("/status/hdcp", api.hdcpStatusHandler)
+	mux.HandleFunc("/switch", api.switchHandler)
+	mux.HandleFunc("/switch/hdcp", api.hdcpSwitchHandler)
+	mux.HandleFunc("/edid", api.edidHandler)
+	mux.HandleFunc("/events", api.eventsHandler)
+
+	return mux
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -1390,6 +1690,10 @@ func (a *apiServer) switchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Der Cache wurde erst nach einem erfolgreichen Matrix-Kommando
+	// aktualisiert, deshalb darf jetzt ein State-Event raus.
+	a.events.Publish()
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
 		"input":    *request.Input,
@@ -1442,6 +1746,8 @@ func (a *apiServer) edidHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	a.events.Publish()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
@@ -1539,6 +1845,8 @@ func (a *apiServer) hdcpSwitchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.events.Publish()
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
 		"input":    *request.Input,
@@ -1564,6 +1872,27 @@ func decodeJSON(r *http.Request, target any) error {
 	return nil
 }
 
+// runPollLoop führt fn wiederholt aus und wartet zwischen zwei Durchläufen
+// interval. Die Pause liegt bewusst zwischen den Durchläufen und nicht zwischen
+// den Startzeitpunkten: Dauert ein Poll länger als das Intervall, bleibt der
+// Telnet-Verbindung trotzdem Zeit für REST-Kommandos und den Full Sync.
+func runPollLoop(ctx context.Context, interval time.Duration, poll func()) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		poll()
+
+		timer.Reset(interval)
+	}
+}
+
 func main() {
 	cfg := loadConfig()
 	debugEnabled = cfg.logLevel == "DEBUG"
@@ -1573,8 +1902,14 @@ func main() {
 	if cfg.matrixCommandDelay < 0 {
 		log.Fatalf("HDMI_MATRIX_COMMAND_DELAY must be >= 0")
 	}
-	if cfg.matrixStatusPollInterval <= 0 {
-		log.Fatalf("HDMI_MATRIX_STATUS_POLL_INTERVAL must be > 0")
+	if cfg.statusPollInterval <= 0 {
+		log.Fatalf("STATUS_POLL_INTERVAL must be > 0")
+	}
+	if cfg.fullSyncInterval <= 0 {
+		log.Fatalf("FULL_SYNC_INTERVAL must be > 0")
+	}
+	if cfg.sseKeepaliveInterval <= 0 {
+		log.Fatalf("SSE_KEEPALIVE_INTERVAL must be > 0")
 	}
 	if cfg.matrixInputs < 0 || cfg.matrixOutputs < 0 {
 		log.Fatalf("HDMI_MATRIX_INPUTS and HDMI_MATRIX_OUTPUTS must be >= 0")
@@ -1583,7 +1918,8 @@ func main() {
 	log.Printf("INFO Starting AV Access controller")
 	log.Printf("INFO Matrix: %s:%d", cfg.matrixHost, cfg.matrixPort)
 	log.Printf("INFO Matrix command delay: %s", cfg.matrixCommandDelay)
-	log.Printf("INFO Matrix status poll interval: %s", cfg.matrixStatusPollInterval)
+	log.Printf("INFO Matrix status poll interval: %s", cfg.statusPollInterval)
+	log.Printf("INFO Matrix full sync interval: %s", cfg.fullSyncInterval)
 	log.Printf("INFO HTTP server: %s:%d", cfg.httpHost, cfg.httpPort)
 
 	matrix := newMatrixConnection(matrixOptions{
@@ -1595,6 +1931,8 @@ func main() {
 		outputs:          cfg.matrixOutputs,
 		configurationURL: cfg.matrixConfigurationURL,
 	})
+
+	events := newStateNotifier(matrix)
 
 	if err := matrix.Connect(); err != nil {
 		log.Printf("WARNING Initial matrix connection failed: %v", err)
@@ -1615,23 +1953,15 @@ func main() {
 			log.Printf("WARNING Initial matrix status refresh failed: %v", err)
 		} else {
 			log.Printf("INFO Initial matrix status cache populated")
+			events.Publish()
 		}
 	}
 
-	api := &apiServer{matrix: matrix}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", api.healthHandler)
-	mux.HandleFunc("/device-info", api.deviceInfoHandler)
-	mux.HandleFunc("/status", api.statusHandler)
-	mux.HandleFunc("/status/hdcp", api.hdcpStatusHandler)
-	mux.HandleFunc("/switch", api.switchHandler)
-	mux.HandleFunc("/switch/hdcp", api.hdcpSwitchHandler)
-	mux.HandleFunc("/edid", api.edidHandler)
+	api := newAPIServer(matrix, events, cfg.sseKeepaliveInterval)
 
 	server := &http.Server{
 		Addr:              net.JoinHostPort(cfg.httpHost, strconv.Itoa(cfg.httpPort)),
-		Handler:           mux,
+		Handler:           newRouter(api),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -1642,35 +1972,44 @@ func main() {
 	)
 	defer stop()
 
-	go func() {
-		ticker := time.NewTicker(cfg.matrixStatusPollInterval)
-		defer ticker.Stop()
+	// Schneller Poll: fragt nur das Routing ab und erkennt damit physische
+	// Umschaltungen an der Matrix innerhalb weniger Sekunden.
+	go runPollLoop(ctx, cfg.statusPollInterval, func() {
+		debugf("Polling matrix routing")
+		if err := matrix.RefreshRouting(); err != nil {
+			log.Printf("WARNING Matrix routing poll failed: %v", err)
+			return
+		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if !matrix.DeviceInfoComplete() {
-					if err := matrix.RefreshDeviceInfo(); err != nil {
-						log.Printf("WARNING Device info refresh failed: %v", err)
-					}
-				}
+		events.Publish()
+	})
 
-				debugf("Refreshing matrix status cache")
-				if err := matrix.RefreshStatus(); err != nil {
-					log.Printf("WARNING Matrix status refresh failed: %v", err)
-					continue
-				}
-				debugf("Matrix status cache refreshed")
+	// Vollständiger Sync: gleicht zusätzlich EDID und HDCP ab.
+	go runPollLoop(ctx, cfg.fullSyncInterval, func() {
+		if !matrix.DeviceInfoComplete() {
+			if err := matrix.RefreshDeviceInfo(); err != nil {
+				log.Printf("WARNING Device info refresh failed: %v", err)
 			}
 		}
-	}()
+
+		debugf("Refreshing matrix status cache")
+		if err := matrix.RefreshStatus(); err != nil {
+			log.Printf("WARNING Matrix status refresh failed: %v", err)
+			return
+		}
+		debugf("Matrix status cache refreshed")
+
+		events.Publish()
+	})
 
 	go func() {
 		<-ctx.Done()
 
 		log.Printf("INFO Stopping controller")
+
+		// Offene SSE-Streams zuerst beenden, sonst wartet Shutdown auf
+		// Verbindungen, die nie von selbst idle werden.
+		events.Close()
 
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(),

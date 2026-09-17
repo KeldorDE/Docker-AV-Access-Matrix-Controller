@@ -2,13 +2,14 @@ FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 
-COPY scripts/app.go ./app.go
+COPY go.mod ./go.mod
+COPY scripts/ ./scripts/
 
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -buildid=" \
     -o /out/av-access-controller \
-    ./app.go
+    ./scripts
 
 FROM scratch
 
