@@ -1,0 +1,86 @@
+name: Build Image
+
+# Gemeinsame Build-Logik für Develop- und Release-Builds. Die aufrufenden
+# Workflows legen lediglich das Image-Tag fest.
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "Tag, unter dem das Image veröffentlicht wird"
+        required: true
+        type: string
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAME: keldorde/av-access-controller
+  DOCKER_BUILD_SUMMARY: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l src/)"
+          if [ -n "$unformatted" ]; then
+            echo "Diese Dateien sind nicht gofmt-konform:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./src/...
+
+      - name: Test
+        run: go test -race ./src/...
+
+  build:
+    name: Build and push
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.GHCR_PACKAGE_USER }}
+          password: ${{ secrets.GHCR_PACKAGE_PAT }}
+
+      - name: Build Image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Zusätzlich zum beweglichen Tag wird der Commit-SHA getaggt, damit
+          # jeder Build eindeutig referenzierbar und rollback-fähig bleibt.
+          tags: |
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          # Der Go-Build-Cache der vorherigen Läufe verkürzt den Build deutlich.
+          cache-from: type=gha,scope=${{ inputs.image_tag }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image_tag }}
+          # Verhindert zusätzliche "unknown/unknown"-Einträge in der Registry.
+          provenance: false
