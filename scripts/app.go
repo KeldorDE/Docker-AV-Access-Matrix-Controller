@@ -106,11 +106,14 @@ func debugf(format string, args ...any) {
 }
 
 type matrixStatusCache struct {
-	mu          sync.RWMutex
-	outputs     []int
-	edids       []int
-	initialized bool
-	updatedAt   time.Time
+	mu              sync.RWMutex
+	outputs         []int
+	edids           []int
+	hdcp            []bool
+	hdcpInitialized bool
+	hdcpUnsupported bool
+	initialized     bool
+	updatedAt       time.Time
 }
 
 // resize passt die Cache-Größe an die tatsächliche Portanzahl der Matrix an.
@@ -125,7 +128,9 @@ func (c *matrixStatusCache) resize(inputs, outputs int) {
 
 	c.edids = make([]int, inputs+1)
 	c.outputs = make([]int, outputs+1)
+	c.hdcp = make([]bool, inputs+1)
 	c.initialized = false
+	c.hdcpInitialized = false
 }
 
 // deviceIdentity sammelt alles, was die Matrix über sich selbst meldet.
@@ -211,6 +216,8 @@ var (
 	versionOnlyRe = regexp.MustCompile(`(?i)^ver\s+(v?\d[\w.\-]*)`)
 	ipFieldRe     = regexp.MustCompile(`(?i)\b(ip|mask|gate)\s*:\s*(\d{1,3}(?:\.\d{1,3}){3})`)
 	ipModeRe      = regexp.MustCompile(`(?i)^ip\s+mode\s+([a-z]+)`)
+	hdcpRe        = regexp.MustCompile(`(?i)^hdcp_s\s+hdmiin(\d+)\s+(on|off|enable[d]?|disable[d]?|1|0)\b`)
+	mappingRe     = regexp.MustCompile(`(?i)^mp\s+(?:hdmi)?in(\d+)\s+(?:hdmi)?out(\d+)\b`)
 	idSanitizeRe  = regexp.MustCompile(`[^a-z0-9]+`)
 )
 
@@ -666,6 +673,8 @@ func (m *matrixConnection) validateOutput(number int) error {
 	return nil
 }
 
+// validateEDID prüft den gültigen Bereich für SET EDID. Die Firmware bietet
+// 15 Profile an; das Command Set V1.0.0 listet veraltet nur 1-12.
 func validateEDID(edid int) error {
 	if edid < 1 || edid > 15 {
 		return errors.New("EDID must be between 1 and 15")
@@ -697,6 +706,36 @@ func (m *matrixConnection) storeEDID(inputNumber, edid int) {
 	m.cache.updatedAt = time.Now()
 }
 
+func (m *matrixConnection) storeHDCP(inputNumber int, enabled bool) {
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+
+	if inputNumber < 1 || inputNumber >= len(m.cache.hdcp) {
+		return
+	}
+
+	m.cache.hdcp[inputNumber] = enabled
+	m.cache.hdcpUnsupported = false
+	m.cache.updatedAt = time.Now()
+}
+
+func (m *matrixConnection) markHDCPUnsupported() {
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+
+	m.cache.hdcpUnsupported = true
+	m.cache.hdcpInitialized = false
+}
+
+// HDCPSupported meldet false, sobald die Matrix ein HDCP-Kommando mit ihrer
+// Welcome-Zeile quittiert hat.
+func (m *matrixConnection) HDCPSupported() bool {
+	m.cache.mu.RLock()
+	defer m.cache.mu.RUnlock()
+
+	return !m.cache.hdcpUnsupported
+}
+
 func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 	if err := m.validateInput(inputNumber); err != nil {
 		return 0, err
@@ -724,10 +763,6 @@ func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 		return 0, err
 	}
 
-	expected := strings.ToLower(
-		fmt.Sprintf("MP in%d hdmiout%d", inputNumber, outputNumber),
-	)
-
 	for {
 		response, err := m.readLineLocked()
 		if err != nil {
@@ -735,7 +770,7 @@ func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 			return 0, err
 		}
 
-		if strings.ToLower(response) == expected {
+		if input, ok := m.parseOutputResponse(response, outputNumber); ok && input == inputNumber {
 			m.storeOutput(outputNumber, inputNumber)
 			return inputNumber, nil
 		}
@@ -748,16 +783,21 @@ func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 	}
 }
 
+// parseOutputResponse zerlegt die Antwort auf GET MP. Die Matrix meldet je nach
+// Firmware "MP hdmiin2 hdmiout1" oder "MP in2 hdmiout1".
 func (m *matrixConnection) parseOutputResponse(response string, outputNumber int) (int, bool) {
-	var input, output int
-	n, err := fmt.Sscanf(
-		strings.ToLower(response),
-		"mp in%d hdmiout%d",
-		&input,
-		&output,
-	)
+	match := mappingRe.FindStringSubmatch(strings.TrimSpace(response))
+	if match == nil {
+		return 0, false
+	}
 
-	if err != nil || n != 2 || input < 1 || input > m.InputCount() || output != outputNumber {
+	input, err := strconv.Atoi(match[1])
+	if err != nil || input < 1 || input > m.InputCount() {
+		return 0, false
+	}
+
+	output, err := strconv.Atoi(match[2])
+	if err != nil || output != outputNumber {
 		return 0, false
 	}
 
@@ -802,11 +842,9 @@ func (m *matrixConnection) SetEDID(inputNumber, edid int) (string, error) {
 	}
 
 	command := fmt.Sprintf("SET EDID hdmiin%d %d", inputNumber, edid)
-	expected := strings.ToLower(
-		fmt.Sprintf("EDID hdmiin%d %d", inputNumber, edid),
-	)
 	matches := func(line string) bool {
-		return strings.ToLower(line) == expected
+		value, ok := parseEDIDResponse(line, inputNumber)
+		return ok && value == edid
 	}
 
 	m.mu.Lock()
@@ -865,6 +903,97 @@ func (m *matrixConnection) GetEDID(inputNumber int) (int, error) {
 	m.storeEDID(inputNumber, edid)
 
 	return edid, nil
+}
+
+func hdcpValue(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
+}
+
+// parseHDCPResponse zerlegt die Antwort auf GET/SET HDCP_S, z. B.
+// "HDCP_S hdmiin1 on".
+func parseHDCPResponse(response string, inputNumber int) (bool, bool) {
+	match := hdcpRe.FindStringSubmatch(strings.TrimSpace(response))
+	if match == nil {
+		return false, false
+	}
+
+	input, err := strconv.Atoi(match[1])
+	if err != nil || input != inputNumber {
+		return false, false
+	}
+
+	switch strings.ToLower(match[2]) {
+	case "on", "enable", "enabled", "1":
+		return true, true
+	case "off", "disable", "disabled", "0":
+		return false, true
+	}
+
+	return false, false
+}
+
+// SetHDCP schaltet HDCP für einen Eingang. Kennt die Matrix das Kommando
+// nicht, kommt errCommandUnsupported zurück.
+func (m *matrixConnection) SetHDCP(inputNumber int, enabled bool) (string, error) {
+	if err := m.validateInput(inputNumber); err != nil {
+		return "", err
+	}
+
+	command := fmt.Sprintf("SET HDCP_S hdmiin%d %s", inputNumber, hdcpValue(enabled))
+	matches := func(line string) bool {
+		value, ok := parseHDCPResponse(line, inputNumber)
+		return ok && value == enabled
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	response, err := m.requestLocked(command, matches, true)
+	if err != nil {
+		if errors.Is(err, errCommandUnsupported) {
+			m.markHDCPUnsupported()
+		}
+		return "", err
+	}
+
+	m.storeHDCP(inputNumber, enabled)
+
+	return response, nil
+}
+
+func (m *matrixConnection) GetHDCP(inputNumber int) (bool, error) {
+	if err := m.validateInput(inputNumber); err != nil {
+		return false, err
+	}
+
+	command := fmt.Sprintf("GET HDCP_S hdmiin%d", inputNumber)
+	matches := func(line string) bool {
+		_, ok := parseHDCPResponse(line, inputNumber)
+		return ok
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	response, err := m.requestLocked(command, matches, true)
+	if err != nil {
+		if errors.Is(err, errCommandUnsupported) {
+			m.markHDCPUnsupported()
+		}
+		return false, err
+	}
+
+	enabled, ok := parseHDCPResponse(response, inputNumber)
+	if !ok {
+		return false, fmt.Errorf("unexpected matrix response: %s", response)
+	}
+
+	m.storeHDCP(inputNumber, enabled)
+
+	return enabled, nil
 }
 
 // RefreshDeviceInfo liest Modell, Firmware und Netzwerkdaten von der Matrix.
@@ -936,15 +1065,34 @@ func (m *matrixConnection) RefreshStatus() error {
 		}
 	}
 
+	hdcpInitialized := false
+	if m.HDCPSupported() {
+		hdcpInitialized = true
+
+		for input := 1; input <= inputs; input++ {
+			if _, err := m.GetHDCP(input); err != nil {
+				if errors.Is(err, errCommandUnsupported) {
+					log.Printf("WARNING Matrix does not support HDCP commands")
+					hdcpInitialized = false
+					break
+				}
+				return fmt.Errorf("refreshing HDCP input %d: %w", input, err)
+			}
+		}
+	}
+
 	m.cache.mu.Lock()
 	m.cache.initialized = true
+	if hdcpInitialized {
+		m.cache.hdcpInitialized = true
+	}
 	m.cache.updatedAt = time.Now()
 	m.cache.mu.Unlock()
 
 	return nil
 }
 
-func (m *matrixConnection) CachedStatus() (map[string]int, bool) {
+func (m *matrixConnection) CachedStatus() (map[string]any, bool) {
 	m.cache.mu.RLock()
 	defer m.cache.mu.RUnlock()
 
@@ -952,12 +1100,33 @@ func (m *matrixConnection) CachedStatus() (map[string]int, bool) {
 		return nil, false
 	}
 
-	result := make(map[string]int, len(m.cache.outputs)+len(m.cache.edids))
+	result := make(map[string]any, len(m.cache.outputs)+2*len(m.cache.edids))
 	for output := 1; output < len(m.cache.outputs); output++ {
 		result[fmt.Sprintf("out%d_in", output)] = m.cache.outputs[output]
 	}
 	for input := 1; input < len(m.cache.edids); input++ {
 		result[fmt.Sprintf("edid_in%d", input)] = m.cache.edids[input]
+	}
+	if m.cache.hdcpInitialized {
+		for input := 1; input < len(m.cache.hdcp); input++ {
+			result[fmt.Sprintf("hdcp_in%d", input)] = m.cache.hdcp[input]
+		}
+	}
+
+	return result, true
+}
+
+func (m *matrixConnection) CachedHDCPStatus() (map[string]bool, bool) {
+	m.cache.mu.RLock()
+	defer m.cache.mu.RUnlock()
+
+	if !m.cache.hdcpInitialized {
+		return nil, false
+	}
+
+	result := make(map[string]bool, len(m.cache.hdcp))
+	for input := 1; input < len(m.cache.hdcp); input++ {
+		result[fmt.Sprintf("hdcp_in%d", input)] = m.cache.hdcp[input]
 	}
 
 	return result, true
@@ -1126,6 +1295,32 @@ func (a *apiServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (a *apiServer) hdcpStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	if !a.matrix.HDCPSupported() {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{
+			"error":   "hdcp_unsupported",
+			"message": "matrix does not support HDCP commands",
+		})
+		return
+	}
+
+	result, ok := a.matrix.CachedHDCPStatus()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "status_unavailable",
+			"message": "matrix HDCP status cache has not been initialized yet",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (a *apiServer) deviceInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -1256,6 +1451,102 @@ func (a *apiServer) edidHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// flexibleBool akzeptiert true/false, 1/0 und "on"/"off", damit Home Assistant
+// REST-Switch-Templates ohne Umwege funktionieren.
+type flexibleBool bool
+
+func (b *flexibleBool) UnmarshalJSON(data []byte) error {
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	switch value := raw.(type) {
+	case bool:
+		*b = flexibleBool(value)
+		return nil
+	case float64:
+		switch value {
+		case 1:
+			*b = true
+			return nil
+		case 0:
+			*b = false
+			return nil
+		}
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "on", "true", "1", "enable", "enabled", "yes":
+			*b = true
+			return nil
+		case "off", "false", "0", "disable", "disabled", "no":
+			*b = false
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid boolean value: %s", strings.TrimSpace(string(data)))
+}
+
+type hdcpRequest struct {
+	Input *int          `json:"input"`
+	HDCP  *flexibleBool `json:"hdcp"`
+}
+
+func (a *apiServer) hdcpSwitchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var request hdcpRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   "invalid_request",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	if request.Input == nil || request.HDCP == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   "invalid_request",
+			"message": "input and hdcp are required",
+		})
+		return
+	}
+
+	enabled := bool(*request.HDCP)
+
+	response, err := a.matrix.SetHDCP(*request.Input, enabled)
+	if err != nil {
+		status := http.StatusInternalServerError
+		errorName := "matrix_error"
+
+		switch {
+		case errors.Is(err, errCommandUnsupported):
+			status = http.StatusNotImplemented
+			errorName = "hdcp_unsupported"
+		case a.matrix.validateInput(*request.Input) != nil:
+			status = http.StatusBadRequest
+			errorName = "invalid_request"
+		}
+
+		writeJSON(w, status, map[string]any{
+			"error":   errorName,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":  true,
+		"input":    *request.Input,
+		"hdcp":     enabled,
+		"response": response,
+	})
+}
+
 func decodeJSON(r *http.Request, target any) error {
 	defer r.Body.Close()
 
@@ -1333,7 +1624,9 @@ func main() {
 	mux.HandleFunc("/health", api.healthHandler)
 	mux.HandleFunc("/device-info", api.deviceInfoHandler)
 	mux.HandleFunc("/status", api.statusHandler)
+	mux.HandleFunc("/status/hdcp", api.hdcpStatusHandler)
 	mux.HandleFunc("/switch", api.switchHandler)
+	mux.HandleFunc("/switch/hdcp", api.hdcpSwitchHandler)
 	mux.HandleFunc("/edid", api.edidHandler)
 
 	server := &http.Server{
