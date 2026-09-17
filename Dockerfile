@@ -8,4 +8,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
+STOPSIGNAL SIGTERM
+
 CMD ["python", "/app/app.py"]
