@@ -1,7 +1,28 @@
+# Versionskontrolle und CI
 .git
-.idea
-.github
-.editorconfig
 .gitattributes
 .gitignore
-.md
+.github
+
+# Editor- und IDE-Konfiguration
+.idea
+.vscode
+.editorconfig
+
+# Dokumentation und Lizenzen
+*.md
+LICENSE
+
+# Build-Metadaten (werden nicht in das Image kopiert)
+Dockerfile
+.dockerignore
+docker-compose*.yml
+.env
+.env.*
+
+# Go-Tests werden im Image nicht gebaut
+src/*_test.go
+
+# Betriebssystem-Artefakte
+.DS_Store
+Thumbs.db
