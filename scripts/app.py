@@ -18,7 +18,7 @@ MATRIX_PORT = int(os.getenv("MATRIX_PORT", "23"))
 MATRIX_TIMEOUT = float(os.getenv("MATRIX_TIMEOUT", "2"))
 
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
+HTTP_PORT = int(os.getenv("HTTP_PORT", "62225"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 

@@ -33,7 +33,7 @@ Build the image:
 docker build -t av-access-matrix-controller .
 ```
 
-The container is configured to run the Python application in `/app` and exposes port `8080`.
+The container is configured to run the Python application in `/app` and exposes port `62225`.
 
 ## Project structure
 
