@@ -66,17 +66,14 @@ vendor
 
 # Project files
 /project/config/database.inc.php
-/project/index.php
 
 #
 # Assets
 # --------------------------------------------------
-/project/assets/core/
 /project/assets/assets.json
 /project/assets/css/
 /project/assets/js/
 /project/assets/webfonts/
-/project/assets/images/
 
 #
 # Project cache
@@ -100,7 +97,25 @@ vendor
 
 
 #
-# Project
+# Project uploads
 # --------------------------------------------------
 
-/project/uploads/
+/project/uploads/*
+!/project/uploads/
+!/project/uploads/.gitkeep
+
+/project/uploads/avatars/*
+!/project/uploads/avatars/
+!/project/uploads/avatars/.gitkeep
+
+/project/uploads/user/*
+!/project/uploads/user/
+!/project/uploads/user/.gitkeep
+
+/project/uploads/user/forum_post/*
+!/project/uploads/user/forum_post/
+!/project/uploads/user/forum_post/.gitkeep
+
+/project/uploads/user/gallery_album/*
+!/project/uploads/user/gallery_album/
+!/project/uploads/user/gallery_album/.gitkeep

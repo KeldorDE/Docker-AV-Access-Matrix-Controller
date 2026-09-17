@@ -52,9 +52,3 @@
 *.woff2 binary
 *.otf binary
 *.p7m binary
-
-# Exclude files from exporting
-
-.gitattributes export-ignore
-.gitignore     export-ignore
-.gitkeep       export-ignore
