@@ -50,8 +50,8 @@ go test ./...
 go test -race ./...
 ```
 
-Die Tests sprechen eine Fake-Matrix über einen lokalen TCP-Socket an und
-brauchen deshalb keine echte AV-Access-Hardware.
+The tests talk to a fake matrix over a local TCP socket and therefore don't
+require any real AV Access hardware.
 
 ## Notes
 
@@ -60,25 +60,25 @@ This repository is intentionally lightweight and focuses on direct communication
 
 ## API Endpoints
 
-| Method | Endpoint       | Parameter                   | Beschreibung                          |
-| ------ | -------------- | --------------------------- | ------------------------------------- |
-| `GET`  | `/health`      | –                           | Prüft die Verbindung zur Matrix       |
-| `GET`  | `/device-info` | `refresh=true` (optional)   | Modell, Firmware, Netzwerk, Portanzahl |
-| `GET`  | `/status`      | –                           | Liefert Routing-, EDID- und HDCP-Status |
-| `GET`  | `/status/hdcp` | –                           | Liefert nur den HDCP-Status je Input  |
-| `GET`  | `/events`      | –                           | Server-Sent-Events-Stream mit dem vollständigen State |
-| `POST` | `/switch`      | `input`, `output`           | Schaltet einen Input auf einen Output |
-| `POST` | `/switch/hdcp` | `input`, `hdcp`             | Schaltet HDCP eines Inputs an/aus     |
-| `POST` | `/edid`        | `input`, `edid: 1–15`       | Setzt das EDID-Profil eines Inputs    |
+| Method | Endpoint       | Parameter                   | Description                            |
+| ------ | -------------- | --------------------------- | --------------------------------------- |
+| `GET`  | `/health`      | –                           | Checks the connection to the matrix     |
+| `GET`  | `/device-info` | `refresh=true` (optional)   | Model, firmware, network, port count    |
+| `GET`  | `/status`      | –                           | Returns routing, EDID and HDCP status   |
+| `GET`  | `/status/hdcp` | –                           | Returns only the HDCP status per input  |
+| `GET`  | `/events`      | –                           | Server-Sent Events stream with the full state |
+| `POST` | `/switch`      | `input`, `output`           | Switches an input to an output          |
+| `POST` | `/switch/hdcp` | `input`, `hdcp`             | Turns HDCP for an input on/off          |
+| `POST` | `/edid`        | `input`, `edid: 1–15`       | Sets the EDID profile of an input       |
 
-Die gültigen Bereiche für `input`/`output` ergeben sich aus der erkannten
-Portanzahl der Matrix (siehe `/device-info`), beim 4KMX44-H2 also `1–4`.
+The valid ranges for `input`/`output` are derived from the detected port count
+of the matrix (see `/device-info`); for the 4KMX44-H2 this is `1–4`.
 
-Die API lauscht standardmäßig auf Port `62225`.
+The API listens on port `62225` by default.
 
-### `/status` und `/status/hdcp`
+### `/status` and `/status/hdcp`
 
-`/status` liefert den kompletten Cache:
+`/status` returns the complete cache:
 
 ```json
 {
@@ -97,19 +97,19 @@ Die API lauscht standardmäßig auf Port `62225`.
 }
 ```
 
-`/status/hdcp` liefert nur die `hdcp_inX`-Werte und eignet sich damit direkt als
-`state_resource` für Home-Assistant-`switch`-Entitäten.
+`/status/hdcp` returns only the `hdcp_inX` values, making it directly usable
+as a `state_resource` for Home Assistant `switch` entities.
 
-Die HDCP-Werte sind boolesch (`true` = HDCP aktiv). Sie stammen aus
-`GET HDCP_S hdmiinX` und werden im selben Poll-Intervall wie Routing und EDID
-aktualisiert. Laut Command Set ist HDCP-Support ab Werk `on`.
+The HDCP values are booleans (`true` = HDCP active). They come from
+`GET HDCP_S hdmiinX` and are updated in the same poll interval as routing and
+EDID. According to the command set, HDCP support is `on` by default.
 
 ### `/events` (Server-Sent Events)
 
-`GET /events` liefert einen dauerhaften `text/event-stream`. Jedes `state`-Event
-enthält den **vollständigen aktuellen Controller-State** – also exakt dieselben
-Felder, die auch `/status` zurückgibt. Es gibt kein separates Statusmodell für
-SSE und keine Teil-Updates einzelner Felder.
+`GET /events` returns a persistent `text/event-stream`. Each `state` event
+contains the **complete current controller state** – i.e. exactly the same
+fields that `/status` returns. There is no separate status model for SSE and
+no partial updates of individual fields.
 
 ```bash
 curl -N http://127.0.0.1:62225/events
@@ -127,29 +127,29 @@ event: state
 data: {"out1_in":1,"out2_in":3,"out3_in":1,"out4_in":4,"edid_in1":5,"edid_in2":5,"edid_in3":5,"edid_in4":5,"hdcp_in1":true,"hdcp_in2":true,"hdcp_in3":true,"hdcp_in4":true}
 ```
 
-Verhalten im Detail:
+Behavior in detail:
 
-- Direkt nach dem Verbinden schickt der Controller den aktuell gecachten State.
-  Existiert noch kein gültiger Cache, wartet der Client auf das nächste reguläre
-  Statusupdate – eine Matrix-Abfrage wird dafür **nicht** ausgelöst.
-- Ein `state`-Event entsteht nur, wenn sich der Cache tatsächlich geändert hat.
-  Ein Poll mit unverändertem Ergebnis erzeugt kein Event. Ändern sich mehrere
-  Felder gleichzeitig, gibt es trotzdem nur ein Event.
-- Änderungen über `/switch`, `/switch/hdcp` und `/edid` werden sofort nach dem
-  erfolgreichen Matrix-Kommando veröffentlicht; auf den nächsten Poll muss
-  niemand warten.
-- Physische Umschaltungen am Frontpanel erkennt der schnelle Poll innerhalb von
-  etwa `STATUS_POLL_INTERVAL`.
-- Alle `SSE_KEEPALIVE_INTERVAL` Sekunden kommt der SSE-Kommentar `: keepalive`,
-  damit Reverse Proxies die Verbindung nicht wegen Inaktivität schließen.
-- `retry: 5000` steuert den automatischen Reconnect gängiger SSE-Clients. Da
-  jedes Event den vollständigen State enthält, gibt es keinen Event-Verlauf und
-  `Last-Event-ID` wird nicht benötigt.
-- Die Anzahl verbundener Clients hat **keinen** Einfluss auf die Anzahl der
-  Matrix-Abfragen: Alle Clients werden aus demselben Cache bedient.
+- Right after connecting, the controller sends the currently cached state.
+  If no valid cache exists yet, the client waits for the next regular status
+  update – a matrix query is **not** triggered for this purpose.
+- A `state` event is only created if the cache actually changed. A poll with
+  an unchanged result does not generate an event. If several fields change at
+  the same time, there is still only one event.
+- Changes made via `/switch`, `/switch/hdcp` and `/edid` are published
+  immediately after the successful matrix command; there's no need to wait
+  for the next poll.
+- Physical switching on the front panel is detected by the fast poll within
+  approximately `STATUS_POLL_INTERVAL`.
+- Every `SSE_KEEPALIVE_INTERVAL` seconds, the SSE comment `: keepalive` is
+  sent so that reverse proxies don't close the connection due to inactivity.
+- `retry: 5000` controls the automatic reconnect of common SSE clients. Since
+  every event contains the full state, there is no event history and
+  `Last-Event-ID` is not needed.
+- The number of connected clients has **no** effect on the number of matrix
+  queries: all clients are served from the same cache.
 
-`/status` bleibt unverändert erhalten und ist weiterhin die richtige Wahl für
-Initialisierung, Diagnose, Fallback und Clients ohne SSE-Unterstützung.
+`/status` remains unchanged and is still the right choice for
+initialization, diagnostics, fallback, and clients without SSE support.
 
 #### Home Assistant
 
@@ -166,38 +166,39 @@ sensor:
     value_template: "{{ value_json.out1_in }}"
 ```
 
-Das obige REST-Sensor-Beispiel pollt weiterhin `/status`. Für Echtzeit-Updates
-abonniert eine Integration stattdessen `http://127.0.0.1:62225/events` und wertet
-die `state`-Events aus – ohne dass dadurch zusätzliche Matrix-Abfragen entstehen.
+The REST sensor example above still polls `/status`. For real-time updates,
+an integration instead subscribes to `http://127.0.0.1:62225/events` and
+evaluates the `state` events – without generating any additional matrix
+queries.
 
-### Polling-Ebenen
+### Polling levels
 
-| Ebene           | Variable               | Default | Kommandos                                   |
-| --------------- | ---------------------- | ------- | ------------------------------------------- |
-| Fast Status Poll| `STATUS_POLL_INTERVAL` | `3s`    | `GET MP all` (ein Kommando für alle Ausgänge) |
-| Full Sync       | `FULL_SYNC_INTERVAL`   | `60s`   | Routing, EDID, HDCP und ggf. Geräteinfos     |
+| Level           | Variable               | Default | Commands                                    |
+| --------------- | ---------------------- | ------- | -------------------------------------------- |
+| Fast Status Poll| `STATUS_POLL_INTERVAL` | `3s`    | `GET MP all` (one command for all outputs)   |
+| Full Sync       | `FULL_SYNC_INTERVAL`   | `60s`   | Routing, EDID, HDCP and, if needed, device info |
 
-Der schnelle Poll fragt nur das Input/Output-Routing ab – also genau den Wert,
-der sich bei physischen Umschaltungen ändert. Im Normalfall kostet er damit ein
-einziges Telnet-Kommando pro Durchlauf, unabhängig von der Anzahl der Ausgänge
-und der verbundenen SSE-Clients.
+The fast poll only queries the input/output routing – exactly the value that
+changes on physical switching. In the normal case it therefore costs a single
+Telnet command per cycle, regardless of the number of outputs and connected
+SSE clients.
 
-Antwortet die Matrix auf `GET MP all` mit ihrer Welcome-Zeile, kennt sie das
-Sammelkommando nicht; der Controller wechselt dann dauerhaft auf `GET MP hdmioutX`
-je Ausgang. Ein einzelnes Timeout gilt dagegen als Transportproblem: Der Poll
-weicht nur für diesen Durchlauf auf Einzelabfragen aus und versucht es danach
-wieder mit dem Sammelkommando. Erst nach mehreren Timeouts in Folge wird das
-Sammelkommando dauerhaft abgeschaltet.
+If the matrix responds to `GET MP all` with its welcome line, it doesn't know
+the batch command; the controller then permanently switches to
+`GET MP hdmioutX` per output. A single timeout, however, is treated as a
+transport problem: the poll only falls back to individual queries for that
+cycle and then tries the batch command again afterwards. Only after several
+consecutive timeouts is the batch command permanently disabled.
 
-Fast Poll, Full Sync und REST-Kommandos teilen sich dieselbe Telnet-Verbindung
-und dieselbe Kommando-Serialisierung inklusive `HDMI_MATRIX_COMMAND_DELAY`. Für
-SSE oder das Polling wird keine zusätzliche Verbindung geöffnet.
+Fast poll, full sync and REST commands share the same Telnet connection and
+the same command serialization, including `HDMI_MATRIX_COMMAND_DELAY`. No
+additional connection is opened for SSE or polling.
 
-Beide Poll-Intervalle sind Pausen **zwischen** zwei Durchläufen, nicht zwischen
-deren Startzeitpunkten. Dauert ein Durchlauf länger als sein Intervall, laufen
-die Polls also nicht ineinander und blockieren die Verbindung nicht dauerhaft.
-Trotzdem gilt: Wer `STATUS_POLL_INTERVAL` deutlich verkleinert, sollte auch
-`HDMI_MATRIX_COMMAND_DELAY` im Blick behalten.
+Both poll intervals are pauses **between** two cycles, not between their
+start times. If a cycle takes longer than its interval, the polls therefore
+don't run into each other and don't block the connection permanently. Still,
+anyone who significantly reduces `STATUS_POLL_INTERVAL` should also keep an
+eye on `HDMI_MATRIX_COMMAND_DELAY`.
 
 ### `/switch/hdcp`
 
@@ -216,15 +217,16 @@ curl -s -X POST -H 'Content-Type: application/json' \
 }
 ```
 
-Für `hdcp` werden neben `true`/`false` auch `1`/`0` sowie die Strings `"on"`,
-`"off"`, `"true"`, `"false"`, `"enable"`, `"disable"`, `"yes"` und `"no"`
-akzeptiert, damit Home-Assistant-Templates ohne Umwege funktionieren.
+For `hdcp`, in addition to `true`/`false`, `1`/`0` as well as the strings
+`"on"`, `"off"`, `"true"`, `"false"`, `"enable"`, `"disable"`, `"yes"` and
+`"no"` are also accepted so that Home Assistant templates work without extra
+conversions.
 
-Kennt die Matrix die HDCP-Kommandos nicht, antworten `/status/hdcp` und
-`/switch/hdcp` mit `501` und `"error": "hdcp_unsupported"`; die `hdcp_inX`-Felder
-fehlen dann auch in `/status`.
+If the matrix doesn't know the HDCP commands, `/status/hdcp` and
+`/switch/hdcp` respond with `501` and `"error": "hdcp_unsupported"`; the
+`hdcp_inX` fields are then also missing from `/status`.
 
-#### Home Assistant Beispiel
+#### Home Assistant example
 
 ```yaml
 switch:
@@ -241,25 +243,25 @@ switch:
 
 ### `/edid`
 
-Gültige Werte (`SET EDID hdmiinX prm`, `prm = 1–15`):
+Valid values (`SET EDID hdmiinX prm`, `prm = 1–15`):
 
-| Wert | Bedeutung                                |
-| ---- | ---------------------------------------- |
-| 1–4  | Kopiert das EDID von Output 1–4          |
-| 5    | 4K@60Hz, 5.1ch Audio, mit HDR            |
-| 6    | 4K@60Hz, 2.0ch Audio, mit HDR            |
-| 7    | 4K@30Hz, 7.1ch Audio, mit HDR            |
-| 8    | 4K@30Hz, 5.1ch Audio, mit HDR            |
-| 9    | 4K@30Hz, 2.0ch Audio, mit HDR            |
-| 10   | 4K@30Hz/8bit, 2.0ch Audio, ohne HDR      |
-| 11   | 1080p@60Hz, 2.0ch Audio                  |
-| 12   | 5K Ultra Wide, 2ch Audio                 |
-| 13   | 5K Super Wide, 2ch Audio                 |
-| 14   | Smart EDID                               |
-| 15   | EDID Write                               |
+| Value | Meaning                                    |
+| ----- | ------------------------------------------- |
+| 1–4   | Copies the EDID from output 1–4              |
+| 5     | 4K@60Hz, 5.1ch audio, with HDR               |
+| 6     | 4K@60Hz, 2.0ch audio, with HDR               |
+| 7     | 4K@30Hz, 7.1ch audio, with HDR               |
+| 8     | 4K@30Hz, 5.1ch audio, with HDR               |
+| 9     | 4K@30Hz, 2.0ch audio, with HDR               |
+| 10    | 4K@30Hz/8bit, 2.0ch audio, without HDR       |
+| 11    | 1080p@60Hz, 2.0ch audio                      |
+| 12    | 5K Ultra Wide, 2ch audio                     |
+| 13    | 5K Super Wide, 2ch audio                     |
+| 14    | Smart EDID                                   |
+| 15    | EDID Write                                   |
 
-Das mitgelieferte Command Set V1.0.0 listet an dieser Stelle veraltet nur
-`1–12`; maßgeblich ist die Auswahl im Web-Interface der Matrix.
+The included Command Set V1.0.0 lists only `1–12` here, which is outdated;
+the selection in the matrix's web interface is authoritative.
 
 ### `/device-info`
 
@@ -288,83 +290,84 @@ curl -s http://127.0.0.1:62225/device-info | jq
 }
 ```
 
-Die Daten werden beim Start einmalig von der Matrix gelesen und zwischengespeichert.
-`?refresh=true` erzwingt eine erneute Abfrage. Solange noch keine Verbindung
-zustande kam, antwortet der Endpoint mit `503`.
+The data is read once from the matrix at startup and cached. `?refresh=true`
+forces a fresh query. As long as no connection has been established yet, the
+endpoint responds with `503`.
 
-#### Herkunft der Felder
+#### Field origins
 
-| Feld                              | Quelle                                                      |
-| --------------------------------- | ----------------------------------------------------------- |
-| `model`                           | Welcome-Zeile beim Connect, bestätigt durch `GET VER`        |
-| `sw_version`, `arm_version`       | `GET VER` (`4KMX44-H2 VER 1.0, ARM VER 1.0`)                 |
-| `ip_address`, `netmask`, `gateway`| `GET IPADDR`                                                 |
-| `ip_mode`                         | `GET IP MODE`                                                |
-| `input_count`, `output_count`     | aus dem Modellnamen abgeleitet (`4KMX44` → 4×4)              |
-| `configuration_url`               | aus der gemeldeten Matrix-IP gebildet                        |
-| `hw_version`                      | im Command Set nicht vorgesehen → immer `null`               |
+| Field                              | Source                                                       |
+| ---------------------------------- | ------------------------------------------------------------- |
+| `model`                            | Welcome line on connect, confirmed by `GET VER`                |
+| `sw_version`, `arm_version`        | `GET VER` (`4KMX44-H2 VER 1.0, ARM VER 1.0`)                    |
+| `ip_address`, `netmask`, `gateway` | `GET IPADDR`                                                    |
+| `ip_mode`                          | `GET IP MODE`                                                   |
+| `input_count`, `output_count`      | derived from the model name (`4KMX44` → 4×4)                    |
+| `configuration_url`                | built from the reported matrix IP                               |
+| `hw_version`                       | not provided for in the command set → always `null`             |
 
-#### Hinweis zu `unique_id`
+#### Note on `unique_id`
 
-Das Command Set des 4KMX44-H2 kennt **kein** Kommando für Seriennummer oder
-MAC-Adresse (dokumentiert sind nur `RESET`, `REBOOT`, `help`, `SET/GET IP MODE`,
-`SET/GET IPADDR`, `GET VER` und `UPG`). Deshalb gibt es kein `serial`-Feld.
+The command set of the 4KMX44-H2 does **not** have a command for serial
+number or MAC address (only `RESET`, `REBOOT`, `help`, `SET/GET IP MODE`,
+`SET/GET IPADDR`, `GET VER` and `UPG` are documented). Therefore there is no
+`serial` field.
 
-`unique_id` wird aus `<model>-<konfigurierter host>` gebildet, z. B.
-`4kmx44-h2-192-168-178-10`. Sie ist damit stabil, solange die Matrix unter
-derselben Adresse erreichbar ist.
+`unique_id` is built from `<model>-<configured host>`, e.g.
+`4kmx44-h2-192-168-178-10`. It is thus stable as long as the matrix is
+reachable under the same address.
 
-## Konfiguration
+## Configuration
 
-| Variable                        | Default         | Beschreibung                                         |
-| ------------------------------- | --------------- | ---------------------------------------------------- |
-| `HDMI_MATRIX_IP`                | `192.168.178.10`| Adresse der Matrix                                   |
-| `HDMI_MATRIX_PORT`              | `23`            | Telnet-Port                                          |
-| `HDMI_MATRIX_TIMEOUT`           | `2`             | Lese-/Schreib-Timeout in Sekunden                    |
-| `HDMI_MATRIX_COMMAND_DELAY`     | `1`             | Mindestabstand zwischen Kommandos in Sekunden        |
-| `STATUS_POLL_INTERVAL`          | `3s`            | Schneller Poll des Routings (erkennt Frontpanel-Umschaltungen) |
-| `FULL_SYNC_INTERVAL`            | `60s`           | Vollständiger Sync inkl. EDID und HDCP               |
-| `SSE_KEEPALIVE_INTERVAL`        | `30s`           | Abstand der `: keepalive`-Kommentare im SSE-Stream    |
-| `HDMI_MATRIX_INPUTS`            | auto            | Überschreibt die erkannte Anzahl Eingänge            |
-| `HDMI_MATRIX_OUTPUTS`           | auto            | Überschreibt die erkannte Anzahl Ausgänge            |
-| `HDMI_MATRIX_CONFIGURATION_URL` | –               | Überschreibt die automatische `configuration_url`    |
-| `HTTP_HOST` / `HTTP_PORT`       | `0.0.0.0`/`62225` | Adresse des HTTP-Servers                           |
-| `LOG_LEVEL`                     | `INFO`          | `DEBUG` protokolliert den Telnet-Verkehr             |
+| Variable                        | Default         | Description                                             |
+| -------------------------------- | --------------- | -------------------------------------------------------- |
+| `HDMI_MATRIX_IP`                | `192.168.178.10`| Address of the matrix                                     |
+| `HDMI_MATRIX_PORT`              | `23`            | Telnet port                                                |
+| `HDMI_MATRIX_TIMEOUT`           | `2`             | Read/write timeout in seconds                              |
+| `HDMI_MATRIX_COMMAND_DELAY`     | `1`             | Minimum spacing between commands in seconds                |
+| `STATUS_POLL_INTERVAL`          | `3s`            | Fast poll of routing (detects front panel switching)       |
+| `FULL_SYNC_INTERVAL`            | `60s`           | Full sync including EDID and HDCP                          |
+| `SSE_KEEPALIVE_INTERVAL`        | `30s`           | Spacing of `: keepalive` comments in the SSE stream         |
+| `HDMI_MATRIX_INPUTS`            | auto            | Overrides the detected number of inputs                    |
+| `HDMI_MATRIX_OUTPUTS`           | auto            | Overrides the detected number of outputs                   |
+| `HDMI_MATRIX_CONFIGURATION_URL` | –               | Overrides the automatic `configuration_url`                |
+| `HTTP_HOST` / `HTTP_PORT`       | `0.0.0.0`/`62225` | Address of the HTTP server                                |
+| `LOG_LEVEL`                     | `INFO`          | `DEBUG` logs the Telnet traffic                             |
 
-Alle Zeitangaben akzeptieren reine Sekundenwerte (`60`, `0.5`) und
-Go-Dauerangaben (`3s`, `1m30s`).
+All time values accept plain seconds (`60`, `0.5`) as well as Go duration
+strings (`3s`, `1m30s`).
 
-`HDMI_MATRIX_STATUS_POLL_INTERVAL` bleibt als Alias für `FULL_SYNC_INTERVAL`
-gültig, damit bestehende Deployments unverändert weiterlaufen. Ist beides
-gesetzt, gewinnt `FULL_SYNC_INTERVAL`.
+`HDMI_MATRIX_STATUS_POLL_INTERVAL` remains valid as an alias for
+`FULL_SYNC_INTERVAL` so that existing deployments keep working unchanged. If
+both are set, `FULL_SYNC_INTERVAL` wins.
 
-#### Beispiele
+#### Examples
 
 ```bash
-# Geräteinformationen
+# Device information
 curl -s http://127.0.0.1:62225/device-info | jq
 
 # Status
 curl -s http://127.0.0.1:62225/status | jq
 
-# Input 2 auf Output 3
+# Input 2 to output 3
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"input":2,"output":3}' \
   http://127.0.0.1:62225/switch | jq
 
-# EDID 10 für Input 4
+# EDID 10 for input 4
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"input":4,"edid":10}' \
   http://127.0.0.1:62225/edid | jq
 
-# HDCP-Status aller Inputs
+# HDCP status of all inputs
 curl -s http://127.0.0.1:62225/status/hdcp | jq
 
-# HDCP für Input 1 deaktivieren
+# Disable HDCP for input 1
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"input":1,"hdcp":false}' \
   http://127.0.0.1:62225/switch/hdcp | jq
 
-# Statusänderungen live mitlesen
+# Follow status changes live
 curl -N http://127.0.0.1:62225/events
 ```
