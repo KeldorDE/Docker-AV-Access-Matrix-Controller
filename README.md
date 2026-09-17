@@ -35,9 +35,9 @@ The container exposes port `62225`.
 
 ## Project structure
 
-- `scripts/app.go` - matrix controller logic
-- `scripts/sse.go` - SSE broker, state notifier and `/events` handler
-- `scripts/*_test.go` - tests (run without a real matrix)
+- `src` - matrix controller logic
+- `src` - SSE broker, state notifier and `/events` handler
+- `src` - tests (run without a real matrix)
 - `go.mod` - Go module definition
 - `Dockerfile` - container image definition
 - `.github/workflows/` - CI/CD workflows
