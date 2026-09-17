@@ -574,24 +574,69 @@ class RequestHandler(BaseHTTPRequestHandler):
     def handle_status(self):
         result = {}
 
-        for output_number in range(1, 5):
-            result[
-                f"out{output_number}_in"
-            ] = matrix.get_output(
-                output_number
-            )
+        with matrix.lock:
+            matrix.ensure_connected()
 
-        for input_number in range(1, 5):
-            result[
-                f"edid_in{input_number}"
-            ] = matrix.get_edid(
-                input_number
-            )
+            commands = []
 
-        self.send_json(
-            200,
-            result,
-        )
+            for output_number in range(1, 5):
+                commands.append(
+                    f"GET MP hdmiout{output_number}"
+                )
+
+            for input_number in range(1, 5):
+                commands.append(
+                    f"GET EDID hdmiin{input_number}"
+                )
+
+            # Alle 8 Kommandos auf einmal senden
+            payload = "".join(
+                f"{command}\r\n"
+                for command in commands
+            ).encode("ascii")
+
+            logger.debug("TX pipelined: %s", commands)
+            matrix.socket.sendall(payload)
+
+            # 4 Routing-Antworten
+            for output_number in range(1, 5):
+                response = matrix._readline()
+
+                match = re.fullmatch(
+                    rf"MP\s+in([1-4])\s+hdmiout{output_number}",
+                    response,
+                    re.IGNORECASE,
+                )
+
+                if not match:
+                    raise RuntimeError(
+                        f"Unexpected response: {response}"
+                    )
+
+                result[f"out{output_number}_in"] = int(
+                    match.group(1)
+                )
+
+            # 4 EDID-Antworten
+            for input_number in range(1, 5):
+                response = matrix._readline()
+
+                match = re.fullmatch(
+                    rf"EDID\s+hdmiin{input_number}\s+(\d+)",
+                    response,
+                    re.IGNORECASE,
+                )
+
+                if not match:
+                    raise RuntimeError(
+                        f"Unexpected response: {response}"
+                    )
+
+                result[f"edid_in{input_number}"] = int(
+                    match.group(1)
+                )
+
+        self.send_json(200, result)
 
 
 # -------------------------------------------------------------------
