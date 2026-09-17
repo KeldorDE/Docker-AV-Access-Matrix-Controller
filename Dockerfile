@@ -2,7 +2,7 @@ FROM python:3.14-alpine
 
 WORKDIR /app
 
-COPY app.py /app/app.py
+COPY scripts/app.py /app/app.py
 
 ENV PYTHONUNBUFFERED=1
 
