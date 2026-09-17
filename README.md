@@ -44,3 +44,32 @@ The container is configured to run the Python application in `/app` and exposes 
 ## Notes
 
 This repository is intentionally lightweight and focuses on direct communication with the AV matrix device over a simple serial-like command protocol.
+
+
+## API Endpoints
+
+| Method | Endpoint  | Parameter                   | Beschreibung                          |
+| ------ | --------- | --------------------------- | ------------------------------------- |
+| `GET`  | `/health` | –                           | Prüft die Verbindung zur Matrix       |
+| `GET`  | `/status` | –                           | Liefert Routing- und EDID-Status      |
+| `POST` | `/switch` | `input: 1–4`, `output: 1–4` | Schaltet einen Input auf einen Output |
+| `POST` | `/edid`   | `input: 1–4`, `edid: 1–15`  | Setzt das EDID-Profil eines Inputs    |
+
+Die API lauscht standardmäßig auf Port `62225`.
+
+#### Beispiele
+
+```bash
+# Status
+curl -s http://127.0.0.1:62225/status | jq
+
+# Input 2 auf Output 3
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"input":2,"output":3}' \
+  http://127.0.0.1:62225/switch | jq
+
+# EDID 4 für Input 4
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"input":4,"edid":4}' \
+  http://127.0.0.1:62225/edid | jq
+```
