@@ -121,6 +121,17 @@ func (m *matrixConnection) connectLocked() error {
 	m.conn = conn
 	m.reader = bufio.NewReader(conn)
 
+	// Die Matrix ist direkt nach dem TCP-Connect noch nicht bereit für
+	// Kommandos. Zuerst sendet sie ihre Welcome-Zeile. Diese vollständig
+	// einlesen, bevor der Controller die Verbindung als bereit betrachtet.
+	greeting, err := m.readLineLocked()
+	if err != nil {
+		m.closeLocked()
+		return fmt.Errorf("reading matrix greeting: %w", err)
+	}
+
+	debugf("Matrix greeting: %q", greeting)
+
 	log.Printf("INFO Connected to matrix")
 	return nil
 }
