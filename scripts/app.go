@@ -20,30 +20,36 @@ import (
 )
 
 const (
-	defaultMatrixHost    = "192.168.178.10"
-	defaultMatrixPort    = 23
-	defaultMatrixTimeout = 2 * time.Second
-	defaultHTTPHost      = "0.0.0.0"
-	defaultHTTPPort      = 62225
+	defaultMatrixHost               = "192.168.178.10"
+	defaultMatrixPort               = 23
+	defaultMatrixTimeout            = 2 * time.Second
+	defaultMatrixCommandDelay       = 1 * time.Second
+	defaultMatrixStatusPollInterval = 60 * time.Second
+	defaultHTTPHost                 = "0.0.0.0"
+	defaultHTTPPort                 = 62225
 )
 
 type config struct {
-	matrixHost    string
-	matrixPort    int
-	matrixTimeout time.Duration
-	httpHost      string
-	httpPort      int
-	logLevel      string
+	matrixHost               string
+	matrixPort               int
+	matrixTimeout            time.Duration
+	matrixCommandDelay       time.Duration
+	matrixStatusPollInterval time.Duration
+	httpHost                 string
+	httpPort                 int
+	logLevel                 string
 }
 
 func loadConfig() config {
 	return config{
-		matrixHost:    envString("HDMI_MATRIX_IP", defaultMatrixHost),
-		matrixPort:    envInt("HDMI_MATRIX_PORT", defaultMatrixPort),
-		matrixTimeout: envDurationSeconds("HDMI_MATRIX_TIMEOUT", defaultMatrixTimeout),
-		httpHost:      envString("HTTP_HOST", defaultHTTPHost),
-		httpPort:      envInt("HTTP_PORT", defaultHTTPPort),
-		logLevel:      strings.ToUpper(envString("LOG_LEVEL", "INFO")),
+		matrixHost:               envString("HDMI_MATRIX_IP", defaultMatrixHost),
+		matrixPort:               envInt("HDMI_MATRIX_PORT", defaultMatrixPort),
+		matrixTimeout:            envDurationSeconds("HDMI_MATRIX_TIMEOUT", defaultMatrixTimeout),
+		matrixCommandDelay:       envDurationSeconds("HDMI_MATRIX_COMMAND_DELAY", defaultMatrixCommandDelay),
+		matrixStatusPollInterval: envDurationSeconds("HDMI_MATRIX_STATUS_POLL_INTERVAL", defaultMatrixStatusPollInterval),
+		httpHost:                 envString("HTTP_HOST", defaultHTTPHost),
+		httpPort:                 envInt("HTTP_PORT", defaultHTTPPort),
+		logLevel:                 strings.ToUpper(envString("LOG_LEVEL", "INFO")),
 	}
 }
 
@@ -89,21 +95,34 @@ func debugf(format string, args ...any) {
 	}
 }
 
-type matrixConnection struct {
-	host    string
-	port    int
-	timeout time.Duration
-
-	mu     sync.Mutex
-	conn   net.Conn
-	reader *bufio.Reader
+type matrixStatusCache struct {
+	mu          sync.RWMutex
+	outputs     [5]int
+	edids       [5]int
+	initialized bool
+	updatedAt   time.Time
 }
 
-func newMatrixConnection(host string, port int, timeout time.Duration) *matrixConnection {
+type matrixConnection struct {
+	host         string
+	port         int
+	timeout      time.Duration
+	commandDelay time.Duration
+
+	mu            sync.Mutex
+	conn          net.Conn
+	reader        *bufio.Reader
+	lastCommandAt time.Time
+
+	cache matrixStatusCache
+}
+
+func newMatrixConnection(host string, port int, timeout, commandDelay time.Duration) *matrixConnection {
 	return &matrixConnection{
-		host:    host,
-		port:    port,
-		timeout: timeout,
+		host:         host,
+		port:         port,
+		timeout:      timeout,
+		commandDelay: commandDelay,
 	}
 }
 
@@ -194,6 +213,15 @@ func (m *matrixConnection) writeLineLocked(command string) error {
 		return errors.New("matrix connection is not open")
 	}
 
+	if m.commandDelay > 0 && !m.lastCommandAt.IsZero() {
+		elapsed := time.Since(m.lastCommandAt)
+		if elapsed < m.commandDelay {
+			wait := m.commandDelay - elapsed
+			debugf("Waiting %s before next matrix command", wait)
+			time.Sleep(wait)
+		}
+	}
+
 	if err := m.conn.SetWriteDeadline(time.Now().Add(m.timeout)); err != nil {
 		return err
 	}
@@ -201,6 +229,9 @@ func (m *matrixConnection) writeLineLocked(command string) error {
 	debugf("TX: %s", command)
 
 	_, err := io.WriteString(m.conn, command+"\r\n")
+	if err == nil {
+		m.lastCommandAt = time.Now()
+	}
 	return err
 }
 
@@ -309,6 +340,10 @@ func (m *matrixConnection) Switch(inputNumber, outputNumber int) (int, error) {
 		}
 
 		if strings.ToLower(response) == expected {
+			m.cache.mu.Lock()
+			m.cache.outputs[outputNumber] = inputNumber
+			m.cache.updatedAt = time.Now()
+			m.cache.mu.Unlock()
 			return inputNumber, nil
 		}
 
@@ -339,7 +374,10 @@ func (m *matrixConnection) GetOutput(outputNumber int) (int, error) {
 
 	command := fmt.Sprintf("GET MP hdmiout%d", outputNumber)
 
-	response, err := m.command(
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	response, err := m.sendLocked(
 		command,
 		func(line string) bool {
 			_, ok := parseOutputResponse(line, outputNumber)
@@ -347,13 +385,32 @@ func (m *matrixConnection) GetOutput(outputNumber int) (int, error) {
 		},
 	)
 	if err != nil {
-		return 0, err
+		log.Printf("WARNING Matrix connection failed: %v; reconnecting", err)
+		m.closeLocked()
+		if connectErr := m.connectLocked(); connectErr != nil {
+			return 0, connectErr
+		}
+		response, err = m.sendLocked(
+			command,
+			func(line string) bool {
+				_, ok := parseOutputResponse(line, outputNumber)
+				return ok
+			},
+		)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	input, ok := parseOutputResponse(response, outputNumber)
 	if !ok {
 		return 0, fmt.Errorf("unexpected matrix response: %s", response)
 	}
+
+	m.cache.mu.Lock()
+	m.cache.outputs[outputNumber] = input
+	m.cache.updatedAt = time.Now()
+	m.cache.mu.Unlock()
 
 	return input, nil
 }
@@ -371,12 +428,38 @@ func (m *matrixConnection) SetEDID(inputNumber, edid int) (string, error) {
 		fmt.Sprintf("EDID hdmiin%d %d", inputNumber, edid),
 	)
 
-	return m.command(
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	response, err := m.sendLocked(
 		command,
 		func(line string) bool {
 			return strings.ToLower(line) == expected
 		},
 	)
+	if err != nil {
+		log.Printf("WARNING Matrix connection failed: %v; reconnecting", err)
+		m.closeLocked()
+		if connectErr := m.connectLocked(); connectErr != nil {
+			return "", connectErr
+		}
+		response, err = m.sendLocked(
+			command,
+			func(line string) bool {
+				return strings.ToLower(line) == expected
+			},
+		)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	m.cache.mu.Lock()
+	m.cache.edids[inputNumber] = edid
+	m.cache.updatedAt = time.Now()
+	m.cache.mu.Unlock()
+
+	return response, nil
 }
 
 func parseEDIDResponse(response string, inputNumber int) (int, bool) {
@@ -402,7 +485,10 @@ func (m *matrixConnection) GetEDID(inputNumber int) (int, error) {
 
 	command := fmt.Sprintf("GET EDID hdmiin%d", inputNumber)
 
-	response, err := m.command(
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	response, err := m.sendLocked(
 		command,
 		func(line string) bool {
 			_, ok := parseEDIDResponse(line, inputNumber)
@@ -410,7 +496,21 @@ func (m *matrixConnection) GetEDID(inputNumber int) (int, error) {
 		},
 	)
 	if err != nil {
-		return 0, err
+		log.Printf("WARNING Matrix connection failed: %v; reconnecting", err)
+		m.closeLocked()
+		if connectErr := m.connectLocked(); connectErr != nil {
+			return 0, connectErr
+		}
+		response, err = m.sendLocked(
+			command,
+			func(line string) bool {
+				_, ok := parseEDIDResponse(line, inputNumber)
+				return ok
+			},
+		)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	edid, ok := parseEDIDResponse(response, inputNumber)
@@ -418,7 +518,52 @@ func (m *matrixConnection) GetEDID(inputNumber int) (int, error) {
 		return 0, fmt.Errorf("unexpected matrix response: %s", response)
 	}
 
+	m.cache.mu.Lock()
+	m.cache.edids[inputNumber] = edid
+	m.cache.updatedAt = time.Now()
+	m.cache.mu.Unlock()
+
 	return edid, nil
+}
+
+func (m *matrixConnection) RefreshStatus() error {
+	for output := 1; output <= 4; output++ {
+		if _, err := m.GetOutput(output); err != nil {
+			return fmt.Errorf("refreshing output %d: %w", output, err)
+		}
+	}
+
+	for input := 1; input <= 4; input++ {
+		if _, err := m.GetEDID(input); err != nil {
+			return fmt.Errorf("refreshing EDID input %d: %w", input, err)
+		}
+	}
+
+	m.cache.mu.Lock()
+	m.cache.initialized = true
+	m.cache.updatedAt = time.Now()
+	m.cache.mu.Unlock()
+
+	return nil
+}
+
+func (m *matrixConnection) CachedStatus() (map[string]int, bool) {
+	m.cache.mu.RLock()
+	defer m.cache.mu.RUnlock()
+
+	if !m.cache.initialized {
+		return nil, false
+	}
+
+	result := make(map[string]int, 8)
+	for output := 1; output <= 4; output++ {
+		result[fmt.Sprintf("out%d_in", output)] = m.cache.outputs[output]
+	}
+	for input := 1; input <= 4; input++ {
+		result[fmt.Sprintf("edid_in%d", input)] = m.cache.edids[input]
+	}
+
+	return result, true
 }
 
 type apiServer struct {
@@ -446,11 +591,11 @@ func (a *apiServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := a.matrix.GetOutput(1)
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+	_, ok := a.matrix.CachedStatus()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"status":  "unavailable",
-			"message": err.Error(),
+			"message": "matrix status cache has not been initialized yet",
 		})
 		return
 	}
@@ -466,34 +611,13 @@ func (a *apiServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := make(map[string]int, 8)
-
-	for output := 1; output <= 4; output++ {
-		input, err := a.matrix.GetOutput(output)
-		if err != nil {
-			log.Printf("ERROR GET /status failed: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error":   "matrix_error",
-				"message": err.Error(),
-			})
-			return
-		}
-
-		result[fmt.Sprintf("out%d_in", output)] = input
-	}
-
-	for input := 1; input <= 4; input++ {
-		edid, err := a.matrix.GetEDID(input)
-		if err != nil {
-			log.Printf("ERROR GET /status failed: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error":   "matrix_error",
-				"message": err.Error(),
-			})
-			return
-		}
-
-		result[fmt.Sprintf("edid_in%d", input)] = edid
+	result, ok := a.matrix.CachedStatus()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "status_unavailable",
+			"message": "matrix status cache has not been initialized yet",
+		})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -628,18 +752,32 @@ func main() {
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
+	if cfg.matrixCommandDelay < 0 {
+		log.Fatalf("HDMI_MATRIX_COMMAND_DELAY must be >= 0")
+	}
+	if cfg.matrixStatusPollInterval <= 0 {
+		log.Fatalf("HDMI_MATRIX_STATUS_POLL_INTERVAL must be > 0")
+	}
+
 	log.Printf("INFO Starting AV Access controller")
 	log.Printf("INFO Matrix: %s:%d", cfg.matrixHost, cfg.matrixPort)
+	log.Printf("INFO Matrix command delay: %s", cfg.matrixCommandDelay)
+	log.Printf("INFO Matrix status poll interval: %s", cfg.matrixStatusPollInterval)
 	log.Printf("INFO HTTP server: %s:%d", cfg.httpHost, cfg.httpPort)
 
 	matrix := newMatrixConnection(
 		cfg.matrixHost,
 		cfg.matrixPort,
 		cfg.matrixTimeout,
+		cfg.matrixCommandDelay,
 	)
 
 	if err := matrix.Connect(); err != nil {
 		log.Printf("WARNING Initial matrix connection failed: %v", err)
+	} else if err := matrix.RefreshStatus(); err != nil {
+		log.Printf("WARNING Initial matrix status refresh failed: %v", err)
+	} else {
+		log.Printf("INFO Initial matrix status cache populated")
 	}
 
 	api := &apiServer{matrix: matrix}
@@ -662,6 +800,25 @@ func main() {
 		syscall.SIGTERM,
 	)
 	defer stop()
+
+	go func() {
+		ticker := time.NewTicker(cfg.matrixStatusPollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				debugf("Refreshing matrix status cache")
+				if err := matrix.RefreshStatus(); err != nil {
+					log.Printf("WARNING Matrix status refresh failed: %v", err)
+					continue
+				}
+				debugf("Matrix status cache refreshed")
+			}
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()
